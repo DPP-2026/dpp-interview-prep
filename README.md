@@ -17,7 +17,8 @@
 | [06-vpc-networking-aws.md](./06-vpc-networking-aws.md) | VPC, Networking & AWS | 18 |
 | [07-behavioral-realtime.md](./07-behavioral-realtime.md) | Behavioral & Real-Time | 19 |
 | [08-observability-logging-monitoring.md](./08-observability-logging-monitoring.md) | Observability — Logging & Monitoring | 24 |
-| **Total** | | **195** |
+| [09-live-troubleshooting-labs.md](./09-live-troubleshooting-labs.md) | Live Troubleshooting Labs — break it, investigate it, fix it | 12 |
+| **Total** | | **207** |
 
 ---
 
