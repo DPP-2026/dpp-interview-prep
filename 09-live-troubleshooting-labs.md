@@ -5,16 +5,18 @@
 > **Only ever run the "Break it" steps against a personal or throwaway sandbox you fully control** (a scratch EKS/kind cluster, an isolated AWS sandbox account). Never run them against shared dev/qa, and never against anything resembling production. Several steps modify IAM policies, security groups, and Route53 records — treat them with the same care you would in a real account.
 >
 > This file deliberately goes **beyond Kubernetes**. Interviewers test the layers around the cluster just as often as the cluster itself — DNS, TLS/certificates, the load balancer, and the CI/CD system. For pure Kubernetes pod/scheduling incidents (`CrashLoopBackOff`, `Pending`, `ImagePullBackOff`, `OOMKilled`, node `NotReady`, ArgoCD drift), see the **"Incident Response Scenarios"** section of [`02-eks-kubernetes.md`](./02-eks-kubernetes.md) — this file picks up everywhere else.
+>
+> **Why the questions are grouped, not split one-cause-per-question.** Real interviews at Google, Amazon, Microsoft, Meta, Netflix, Uber, and large regulated shops like JPMorgan and Goldman Sachs almost never ask "what causes X" for a single narrow cause — the standard senior SRE/Platform prompt is "here's a symptom, walk me through *every* plausible cause, in order of likelihood, and how you'd isolate each one." Answering with only one cause when three exist reads as inexperience, even if the one cause you name is correct. Each question below is grouped that way on purpose, with a decision tree at the end — that's the actual shape of the question you'll be asked, not an artificial simplification.
 
 ---
 
 ## Table of Contents
 
-1. [DNS & TLS](#1-dns--tls) — Q1–Q3
-2. [Load Balancer & Ingress](#2-load-balancer--ingress) — Q4–Q6
-3. [Database](#3-database) — Q7–Q8
-4. [Secrets Management](#4-secrets-management) — Q9
-5. [CI/CD Outside Kubernetes](#5-cicd-outside-kubernetes) — Q10–Q12
+1. [DNS & TLS](#1-dns--tls) — Q1–Q2
+2. [Load Balancer & Ingress](#2-load-balancer--ingress) — Q3–Q4
+3. [Database](#3-database) — Q5
+4. [Secrets Management](#4-secrets-management) — Q6
+5. [CI/CD Outside Kubernetes](#5-cicd-outside-kubernetes) — Q7–Q8
 
 ---
 
@@ -23,6 +25,8 @@
 ---
 
 **Q1. The pharma portal (`https://portal.zen-pharma.internal`) suddenly shows a browser TLS warning — "Your connection is not private, NET::ERR_CERT_DATE_INVALID." Reproduce this live, investigate it, and fix it.**
+
+**Asked in this style at:** Google, Amazon, Microsoft — TLS/PKI lifecycle questions are a standard filter for any role touching public-facing services, because so few candidates have actually operated a CA/ACME pipeline rather than just clicking "renew" in a console.
 
 **What is being tested:** Whether you understand cert-manager's ACME renewal flow well enough to find *why* renewal failed, instead of just manually swapping in a new cert and never learning the root cause.
 
@@ -97,9 +101,15 @@ curl -vI https://portal.zen-pharma.internal
 
 ---
 
-**Q2. `api.zen-pharma.com` used to resolve to the prod load balancer; now it resolves to an old, decommissioned one and users get connection timeouts. Reproduce it, investigate, and fix it.**
+**Q2. Two DNS complaints land at once: a public API domain resolves to the wrong, decommissioned load balancer, and separately, pods intermittently fail to resolve an internal RDS hostname. Walk me through investigating DNS end-to-end — from the public record down to in-cluster resolution — and fixing each layer.**
 
-**What is being tested:** Understanding of DNS resolution layers (resolver cache vs. authoritative answer), and how to prove a Route53 record is actually wrong — versus just a caching artifact — before touching anything.
+**Asked in this style at:** Amazon and Google in particular love "trace the full resolution path" framing for SRE/Infra roles — it tests whether you treat DNS as a stack of independent layers (authoritative record → resolver cache → in-cluster resolver) instead of one opaque black box you restart when it's broken.
+
+**What is being tested:** Whether you can tell apart an external record problem (Route53/IaC drift) from an internal one (CoreDNS capacity) using the right tool for each layer, rather than randomly restarting things.
+
+---
+
+### Cause 1: External record drift (Route53 record doesn't match Terraform state)
 
 **Break it (reproduce live):**
 
@@ -135,47 +145,32 @@ dig api.zen-pharma.com +trace                  # walk the delegation chain, conf
 cd zen-infra && terraform plan -target=aws_route53_record.api
 # Plan: 1 to change  → confirms drift: something changed this outside the PR-reviewed flow
 
-aws route53 list-resource-record-sets --hosted-zone-id Z0123456789ABC \
-  --query "ResourceRecordSets[?Name=='api.zen-pharma.com.']"
-
 aws elbv2 describe-load-balancers --names old-decommissioned-nlb 2>&1
 # An error occurred (LoadBalancerNotFound) — confirms the target doesn't even exist anymore
 ```
 
-**Root cause:** a manual console change (or a `terraform apply` run from a stale branch whose module output still referenced the old NLB) overwrote the Route53 alias record outside the normal PR-reviewed flow, so the live record and Terraform state diverged.
+**Root cause:** a manual console change (or a `terraform apply` run from a stale branch whose module output still referenced the old NLB) overwrote the Route53 alias record outside the normal PR-reviewed flow.
 
 **Fix:**
 
 ```bash
-terraform apply -target=aws_route53_record.api   # reconciles the record back to Terraform's declared state
+terraform apply -target=aws_route53_record.api
 dig api.zen-pharma.com +short
 ```
 
-<details>
-<summary>📘 Teaching note</summary>
-
-**Why `dig @8.8.8.8` matters here.** This record is an **Alias** to a load balancer, not a plain A record with a TTL you control — Route53 itself re-evaluates alias targets on every query, no caching at that layer. But resolvers *downstream* of Route53 (your laptop's OS resolver, corporate DNS, the browser) still cache whatever answer they last got, for their own TTL. Querying a public resolver directly sidesteps a possibly-stale local cache and gets you a fresh answer while you're debugging — without it, you might "fix" the record and still see the old IP for several more minutes purely from local caching, and mistakenly think the fix didn't work.
-
-</details>
-
 ---
 
-**Q3. Pods intermittently fail to resolve the RDS hostname — about 1 in 10 requests throw `UnknownHostException`, the rest succeed. Reproduce it, investigate, fix.**
-
-**What is being tested:** Whether you know CoreDNS is a regular, resource-constrained Deployment that can be overloaded — not a magic always-on service — and how to prove that in-cluster.
+### Cause 2: Internal resolver capacity (CoreDNS overloaded)
 
 **Break it (reproduce live):**
 
 ```bash
-# Remove CoreDNS's HA and headroom
 kubectl scale deployment coredns -n kube-system --replicas=1
 kubectl set resources deployment coredns -n kube-system -c coredns --limits=cpu=50m,memory=30Mi
 
-# Flood it with concurrent lookups from several pods
 kubectl create job dns-stress --image=busybox --dry-run=client -o yaml \
   -- /bin/sh -c "for i in $(seq 1 5000); do nslookup drug-catalog-db.xxxxx.us-east-1.rds.amazonaws.com; done" \
-  | kubectl apply -f - 
-kubectl scale job dns-stress --replicas=10 2>/dev/null || kubectl create -f - <<< "$(kubectl get job dns-stress -o json)"
+  | kubectl apply -f -
 ```
 
 **Investigate:**
@@ -188,12 +183,9 @@ kubectl logs -n kube-system -l k8s-app=kube-dns --since=5m | grep -i "error\|tim
 kubectl exec -n prod deploy/manufacturing-service -- \
   sh -c 'for i in $(seq 1 20); do nslookup drug-catalog-db.xxxxx.us-east-1.rds.amazonaws.com; done' \
   | grep -c "can't resolve\|NXDOMAIN"
-
-# If Prometheus scrapes CoreDNS:
-#   rate(coredns_dns_responses_total{rcode="SERVFAIL"}[5m])
 ```
 
-**Root cause:** CoreDNS was scaled down to a single replica (no HA) with undersized CPU/memory limits. Under query volume it gets CPU-throttled; UDP DNS queries that land during a throttled window get dropped or time out, while the rest succeed normally — hence the *intermittent*, not total, failure pattern.
+**Root cause:** CoreDNS scaled to a single replica with undersized CPU/memory limits gets throttled under load; UDP queries landing during a throttled window get dropped, while the rest succeed — hence *intermittent*, not total, failure.
 
 **Fix:**
 
@@ -203,9 +195,30 @@ kubectl set resources deployment coredns -n kube-system -c coredns \
   --limits=cpu=200m,memory=170Mi --requests=cpu=100m,memory=70Mi
 ```
 
-Longer term: install the `cluster-proportional-autoscaler` for CoreDNS (scales replica count with cluster node/pod count automatically), and enable app-level DNS result caching (JVM `networkaddress.cache.ttl`, or tune `dnsConfig`/`ndots`) so not every request performs a fresh lookup.
+Longer term: install the `cluster-proportional-autoscaler` for CoreDNS, and enable app-level DNS result caching (JVM `networkaddress.cache.ttl`) so not every request performs a fresh lookup.
 
-**Verify:** rerun the 20-lookup loop from the app pod, confirm 0 failures; `kubectl top pod` shows headroom again.
+---
+
+### Decision tree
+
+```
+DNS-looking symptom
+       │
+       ├── One specific external domain resolves to a wrong/stale target
+       │       → dig +trace / dig @8.8.8.8, compare against `terraform plan`
+       │       → Cause 1: Route53 record drifted outside IaC
+       │
+       └── In-cluster lookups intermittently fail (some succeed, some don't)
+               → kubectl get pods/top pod -n kube-system -l k8s-app=kube-dns
+               → Cause 2: CoreDNS under-provisioned / no HA / query-volume throttling
+```
+
+<details>
+<summary>📘 Teaching note</summary>
+
+**Why `dig @8.8.8.8` matters for Cause 1.** The record is an **Alias**, so Route53 itself re-evaluates it on every query — no caching at that layer. But resolvers *downstream* (OS, corporate DNS, browser) still cache their last answer for their own TTL. Querying a public resolver directly sidesteps a possibly-stale local cache, so you don't mistake "my fix didn't work" for "my fix worked but my laptop's cache hasn't expired yet."
+
+</details>
 
 ---
 
@@ -213,9 +226,24 @@ Longer term: install the `cluster-proportional-autoscaler` for CoreDNS (scales r
 
 ---
 
-**Q4. Every service behind the Ingress starts timing out at once — not just one service. Reproduce a total Ingress outage, investigate it, and fix it.**
+**Q3. The load balancer reports target(s) unhealthy. Walk me through every plausible cause, from most to least likely, and how you'd isolate each one.**
 
-**What is being tested:** Recognition that the Ingress controller is a *shared control plane* — one bad config change here has 100% blast radius, unlike a single bad app deploy.
+**Asked in this style at:** Google, Meta, and Uber SRE interviews standardize on exactly this "give me the full decision tree, not just the one cause you personally hit" phrasing — they're checking whether your mental model spans the app, Kubernetes, and network layers, not just whichever single bug you remember from a past incident.
+
+**What is being tested:** Systematic, layer-by-layer elimination — application, then Kubernetes, then network — instead of guessing based on the last outage you happened to see.
+
+---
+
+### Cause 1 (most common): application-level — readiness probe misconfigured
+
+This is the single most common real-world cause and is covered in full depth, with the exact incident narrative, in [`07-behavioral-realtime.md`](./07-behavioral-realtime.md) Q5 and G2 — a Helm values change pointed the readiness probe at a path that doesn't exist (`/health/ready` instead of `/actuator/health/readiness`), pods stayed `Running` but were marked `NotReady`, and the load balancer correctly stopped sending them traffic. Worth re-reading here because it's the first thing to rule out:
+
+```bash
+kubectl get pods -n prod -o wide          # Running but check READY column, not just STATUS
+kubectl describe pod <pod> -n prod | grep -A5 Readiness
+```
+
+### Cause 2: the Ingress controller itself is down — total outage, not partial
 
 **Break it (reproduce live):**
 
@@ -242,7 +270,7 @@ aws elbv2 describe-target-health --target-group-arn <nlb-tg-arn>
 # All targets unhealthy — because no controller pod behind them is Ready
 ```
 
-**Root cause:** an invalid ConfigMap value broke NGINX's config template validation. Every controller replica that restarted picked up the bad config and failed to start `nginx`, taking down routing for **every** Ingress resource in the cluster simultaneously.
+**Root cause:** an invalid ConfigMap value broke NGINX's config template validation. Every controller replica that restarted picked up the bad config and failed to start `nginx`, taking down routing for **every** Ingress resource in the cluster simultaneously — the tell here is that *all* services are down at once, not just one.
 
 **Fix:**
 
@@ -253,20 +281,75 @@ kubectl rollout restart deployment ingress-nginx-controller -n ingress-nginx
 kubectl rollout status deployment ingress-nginx-controller -n ingress-nginx
 ```
 
-**Verify:** curl several different services through the Ingress domain; confirm NLB targets go healthy again.
+### Cause 3 (hardest to spot): security group blocking the NodePort range
+
+**Break it (reproduce live):**
+
+```bash
+aws ec2 revoke-security-group-ingress \
+  --group-id sg-0123456789nodesg \
+  --protocol tcp --port 30000-32767 \
+  --cidr 10.0.0.0/16
+```
+
+**Investigate:**
+
+```bash
+kubectl get pods -n prod -o wide                       # Running, Ready — everything K8s-visible is healthy
+kubectl get endpoints drug-catalog-service -n prod      # Endpoints populated correctly
+
+aws elbv2 describe-target-health --target-group-arn <tg-arn>
+# TargetHealth: unhealthy, Reason: Target.Timeout
+
+# From a bastion/EC2 instance in the same VPC — test the network path directly
+nc -zv <node-private-ip> <node-port>
+# Connection timed out   ← proves this is a network-path problem, not app or Kubernetes
+
+aws ec2 describe-security-groups --group-ids sg-0123456789nodesg \
+  --query "SecurityGroups[0].IpPermissions"
+# Missing the NodePort-range ingress rule that should be there
+```
+
+**Root cause:** a Terraform change to the node security group (e.g. during a compliance tightening pass) removed the rule allowing the NLB's health checks — and real traffic — to reach the node's NodePort range. Every Kubernetes-level object is completely healthy, which is exactly why this one is hard: nothing `kubectl` can see is wrong.
+
+**Fix:**
+
+```bash
+git revert <bad-sg-commit> && terraform apply
+```
+
+---
+
+### Decision tree
+
+```
+LB reports target(s) unhealthy
+       │
+       ├── kubectl get pods → Running but NOT Ready
+       │       → Cause 1: readiness probe misconfigured (see 07-behavioral-realtime.md Q5/G2)
+       │
+       ├── kubectl get pods → not even Running (CrashLoopBackOff)
+       │       → Cause 2: ingress controller itself broken — check its own logs/ConfigMap
+       │
+       └── kubectl get pods → Running AND Ready, Endpoints populated, LB still times out
+               → Cause 3: network path blocked — check security groups, NACLs, route tables
+               → test with `nc`/`telnet` from an instance in the same VPC, not with kubectl
+```
 
 <details>
 <summary>📘 Teaching note</summary>
 
-Because `ingress-nginx` is a single shared dependency for every Service exposed outside the cluster, its blast radius for a bad config change is categorically different from an app-level bad deploy — a bad app deploy takes down one Service; a bad Ingress ConfigMap takes down all of them at once. This is the argument for validating ConfigMap changes with `kubectl exec <pod> -- nginx -t` before rolling them out, or running a canary replica first.
+**The general rule to state out loud in an interview:** narrow top-down — app health, then K8s object health, then network path — and only escalate to the next layer once the current one is *proven* healthy, not assumed. Cause 3 is the one that separates senior candidates: most people stop checking once `kubectl` says everything is fine, without remembering that `kubectl` has no visibility into security groups or NACLs at all.
 
 </details>
 
 ---
 
-**Q5. `/api/v2/inventory` returns 404 through the Ingress, but every other endpoint on `drug-catalog-service` works fine. Reproduce it, investigate, fix.**
+**Q4. `/api/v2/inventory` returns 404 through the Ingress, but every other endpoint on `drug-catalog-service` works fine. Reproduce it, investigate, fix.**
 
-**What is being tested:** Whether you can tell an Ingress routing bug apart from an application bug — a very common trap, since both present as "404."
+**Asked in this style at:** Microsoft and Amazon — a very common "is this actually the same kind of 404 you're used to" trap question, because most candidates jump straight to application logs.
+
+**What is being tested:** Whether you can tell an Ingress routing bug apart from an application bug — both present as "404," but they require completely different fixes.
 
 **Break it (reproduce live):**
 
@@ -303,62 +386,19 @@ kubectl exec -n ingress-nginx deploy/ingress-nginx-controller -- \
 
 ---
 
-**Q6. The NLB reports all targets unhealthy, but `kubectl get pods` shows every pod `Running` and `Ready`, and the readiness probe path is confirmed correct. Reproduce it, investigate, fix.**
-
-**What is being tested:** Whether you know to look at the network path itself — security groups, NACLs, routing — once every Kubernetes-level signal says "healthy." This is deliberately a different root cause from the classic "wrong readiness probe path" story (see `07-behavioral-realtime.md` Q5/G2) — here, everything above the network layer is fine.
-
-**Break it (reproduce live):**
-
-```bash
-aws ec2 revoke-security-group-ingress \
-  --group-id sg-0123456789nodesg \
-  --protocol tcp --port 30000-32767 \
-  --cidr 10.0.0.0/16
-```
-
-**Investigate:**
-
-```bash
-kubectl get pods -n prod -o wide                       # Running, Ready — all healthy
-kubectl get endpoints drug-catalog-service -n prod      # Endpoints populated correctly
-
-aws elbv2 describe-target-health --target-group-arn <tg-arn>
-# TargetHealth: unhealthy, Reason: Target.Timeout
-
-# From a bastion/EC2 instance in the same VPC — test the network path directly
-nc -zv <node-private-ip> <node-port>
-# Connection timed out   ← proves this is a network-path problem, not app or Kubernetes
-
-aws ec2 describe-security-groups --group-ids sg-0123456789nodesg \
-  --query "SecurityGroups[0].IpPermissions"
-# Missing the NodePort-range ingress rule that should be there
-```
-
-**Root cause:** a Terraform change to the node security group (e.g. during a compliance tightening pass) accidentally removed the ingress rule allowing the NLB's health-check probes — and real traffic — to reach the node's NodePort range. Every Kubernetes-level object (Service, Endpoints, pod readiness) is completely healthy, which is exactly why this one is hard: nothing `kubectl` can see is wrong.
-
-**Fix:**
-
-```bash
-# revert through Terraform, not the AWS CLI directly, so state stays consistent with the fix
-git revert <bad-sg-commit> && terraform apply
-```
-
-<details>
-<summary>📘 Teaching note</summary>
-
-**The general rule to state out loud in an interview:** "pods Ready, but the LB still says unhealthy" always means the problem sits *between* the load balancer and the pod, never inside either one. Check, in order: (1) Service/Endpoints, (2) security groups on the NodePort range, (3) NACLs, (4) route tables. No `kubectl` command can see this layer directly — you have to test connectivity from the network path itself (a bastion host, VPC Reachability Analyzer, or a raw `nc`/`telnet` from an instance in the same VPC).
-
-</details>
-
----
-
 ## 3. Database
 
 ---
 
-**Q7. `manufacturing-service` starts throwing `FATAL: sorry, too many clients already` from Postgres under otherwise normal traffic. Reproduce it, investigate, fix.**
+**Q5. The database layer is misbehaving under normal operation — walk me through diagnosing connection issues, both under steady load and right after a failover.**
 
-**What is being tested:** Whether you check both structural causes (pool size × replica count vs. `max_connections`) and leak-style causes (idle/abandoned sessions) rather than just restarting pods and hoping.
+**Asked in this style at:** JPMorgan, Goldman Sachs, and Amazon lean heavily on DB connection-pool behavior for backend/platform roles — it's one of the most reliable "have you actually operated this in production" filters, since it's very hard to fake without hands-on experience.
+
+**What is being tested:** Whether you check both structural causes (pool size × replica count) and time-of-event causes (failover) rather than treating "database problem" as one monolithic category.
+
+---
+
+### Cause 1: connection pool exhaustion under steady load
 
 **Break it (reproduce live, dev/sandbox RDS only):**
 
@@ -381,14 +421,12 @@ psql "$RDS_ADMIN_URI" -c "SELECT count(*), state FROM pg_stat_activity GROUP BY 
 #     20 | idle
 
 psql "$RDS_ADMIN_URI" -c "SHOW max_connections;"
-psql "$RDS_ADMIN_URI" -c "SELECT usename, count(*) FROM pg_stat_activity GROUP BY usename;"
-
 kubectl get deployment manufacturing-service -n dev -o jsonpath='{.spec.replicas}'
 kubectl exec -n dev deploy/manufacturing-service -- env | grep -i hikari
 # HIKARI_MAXIMUM_POOL_SIZE=10, replicas=3 → up to 30 possible connections against a lower connection ceiling
 ```
 
-**Root cause:** two causes to check every time, independent of each other — (1) `replica_count × pool_size` for a single service can already exceed what the RDS instance allows, and gets worse the more services share one instance; (2) idle or abandoned sessions (a transaction opened and never closed, or a debugging `psql` session left open) hold connection slots indefinitely regardless of pool size.
+**Root cause:** two independent causes to check every time — (1) `replica_count × pool_size` for a single service can already exceed what the instance allows, and gets worse the more services share one RDS instance; (2) idle or abandoned sessions (a transaction never closed, a debugging `psql` session left open) hold connection slots indefinitely regardless of pool size.
 
 **Fix:**
 
@@ -402,13 +440,7 @@ psql "$RDS_ADMIN_URI" -c "
 kubectl set env deployment/manufacturing-service -n dev HIKARI_MAXIMUM_POOL_SIZE=5
 ```
 
-**Verify:** `pg_stat_activity` count back under the limit; app logs clean.
-
----
-
-**Q8. RDS just failed over (planned maintenance or an AZ event). The AWS console shows the failover completed in about 60 seconds, but the app keeps returning 500s for several more minutes. Reproduce it, investigate, fix.**
-
-**What is being tested:** The distinction between *infrastructure* recovery time and *application* recovery time — a connection pool doesn't automatically know a failover happened.
+### Cause 2: failover — the database recovers, the application doesn't
 
 **Break it (reproduce live, dev/sandbox RDS only):**
 
@@ -423,7 +455,6 @@ aws rds describe-events --source-identifier drug-catalog-db-dev --source-type db
 
 kubectl logs -n dev deploy/drug-catalog-service --since=2m -f
 # HikariPool-1 - Connection is not available, request timed out
-# org.postgresql.util.PSQLException: An I/O error occurred while sending to the backend
 
 psql "$RDS_ADMIN_URI" -c "SELECT 1;"     # DB itself is already healthy again — confirms the gap is app-side
 
@@ -431,7 +462,7 @@ kubectl exec -n dev deploy/drug-catalog-service -- env | grep -i "VALIDATION\|MA
 # HIKARI_VALIDATION_TIMEOUT=250000   (250s) ← pool keeps handing out stale connections for minutes
 ```
 
-**Root cause:** HikariCP's pool has no awareness that a failover changed which physical instance the RDS endpoint DNS name points to. Existing pooled TCP connections to the old primary aren't automatically closed — they only get evicted once Hikari's own `validationTimeout`/`maxLifetime` checks catch them as dead. A window set too high means the pool keeps handing out connections it believes are healthy for minutes after the database itself has already recovered.
+**Root cause:** HikariCP has no awareness that a failover changed which physical instance the RDS endpoint DNS name points to. Existing pooled connections to the old primary aren't automatically dropped — they're only evicted once Hikari's own `validationTimeout`/`maxLifetime` checks catch them as dead. A window set too high means the pool keeps handing out connections it believes are healthy for minutes after the database itself has already recovered.
 
 **Fix:**
 
@@ -442,7 +473,21 @@ kubectl rollout restart deployment drug-catalog-service -n dev
 
 Add a Grafana panel on `hikaricp_connections_active` / `hikaricp_connections_timeout` so this gap is visible immediately next time instead of inferred from logs after the fact.
 
-**Verify:** trigger another test failover in a lower environment; confirm the app recovers within seconds of the database recovering, not minutes.
+---
+
+### Decision tree
+
+```
+DB-layer symptom
+       │
+       ├── "too many clients" / connections refused, under normal load
+       │       → psql: SELECT count(*), state FROM pg_stat_activity GROUP BY state;
+       │       → Cause 1: pool size × replicas > max_connections, or idle-session leak
+       │
+       └── Errors start right after a maintenance window / AZ event, DB itself responds fine
+               → psql "SELECT 1;" succeeds, but app still errors
+               → Cause 2: connection pool hasn't evicted stale connections to the old primary
+```
 
 ---
 
@@ -450,7 +495,9 @@ Add a Grafana panel on `hikaricp_connections_active` / `hikaricp_connections_tim
 
 ---
 
-**Q9. `kubectl get externalsecret -A` shows `jwt-secret` in `prod` as `SecretSyncedError`. The Kubernetes Secret still exists, but pods reading it are getting stale/empty values. Reproduce it, investigate, fix.**
+**Q6. `kubectl get externalsecret -A` shows `jwt-secret` in `prod` as `SecretSyncedError`. The Kubernetes Secret still exists, but pods reading it are getting stale/empty values. Reproduce it, investigate, fix.**
+
+**Asked in this style at:** Google and Microsoft — IRSA/Workload Identity exact-string-matching bugs are a favorite "small typo, big blast radius" question because they can't be answered from documentation alone; you have to have actually hit one.
 
 **What is being tested:** Whether you understand that ESO failing to sync does **not** delete the existing Secret — which is exactly why this bug is confusing: it looks like "the secret went empty," not "the secret disappeared."
 
@@ -481,7 +528,6 @@ kubectl describe externalsecret jwt-secret -n prod
 
 kubectl logs -n external-secrets deploy/external-secrets --since=10m | grep jwt-secret
 
-# Confirm from inside the actual IRSA identity
 kubectl run debug --rm -it --image=amazon/aws-cli -n external-secrets \
   --overrides='{"spec":{"serviceAccountName":"external-secrets-sa"}}' -- sts get-caller-identity
 ```
@@ -507,9 +553,11 @@ kubectl rollout restart deployment auth-service -n prod
 
 ---
 
-**Q10. The deploy job in GitHub Actions starts failing with `Error: Could not assume role with OIDC: Not authorized to perform sts:AssumeRoleWithWebIdentity`, right after a Terraform change to the CI IAM role. Reproduce it, investigate, fix.**
+**Q7. The deploy job in GitHub Actions starts failing with `Error: Could not assume role with OIDC: Not authorized to perform sts:AssumeRoleWithWebIdentity`, right after a Terraform change to the CI IAM role. Reproduce it, investigate, fix.**
 
-**What is being tested:** Whether you know OIDC federation does exact string matching on the JWT's `sub` claim — the same failure class as the IRSA story in `07-behavioral-realtime.md` Q6, one layer up the stack.
+**Asked in this style at:** Netflix, Uber, and Meta — OIDC federation bugs are a common "prove you understand the trust boundary, not just the YAML" question for platform/infra roles building internal CI systems.
+
+**What is being tested:** Whether you know OIDC federation does exact string matching on the JWT's `sub` claim — the same failure class as the IRSA story in `07-behavioral-realtime.md` Q6 and Q6 above, one layer up the stack.
 
 **Break it (reproduce live):**
 
@@ -537,7 +585,7 @@ grep -A3 "permissions:" .github/workflows/deploy.yml
 # id-token: write   ← present and correct, so this isn't the "missing permission" flavor of this bug
 ```
 
-**Root cause:** the trust policy was updated to trust a different branch ref than the one actually pushing. Every workflow run on `main` presents a token whose `sub` claim the role's trust condition simply doesn't match — same exact-string-matching failure class as OIDC/IRSA anywhere else, just at the CI layer instead of the pod layer.
+**Root cause:** the trust policy was updated to trust a different branch ref than the one actually pushing. Every workflow run on `main` presents a token whose `sub` claim the role's trust condition simply doesn't match.
 
 **Fix:**
 
@@ -554,9 +602,15 @@ condition {
 
 ---
 
-**Q11. PRs build and deploy to DEV fine. The moment a PR merges to `main`, the exact same job hangs indefinitely instead of running or failing outright. Reproduce it, investigate, fix.**
+**Q8. A CI/CD job is stuck — not failing, not erroring, just sitting there indefinitely. Walk me through investigating this on GitHub Actions, and how the same investigation maps if the interviewer's company runs Jenkins instead.**
 
-**What is being tested:** Whether you know to check the *environment/approval-gate configuration* when a job just sits there with no error — because `grep -i error` on the logs finds nothing at all.
+**Asked in this style at:** large regulated shops still running Jenkins (banks, insurers, older tech giants mid-migration) ask the Jenkins half directly; Big Tech infra teams (Google, Amazon, Meta) ask the "map it to a tool you don't use" half specifically to test conceptual vs. memorized knowledge.
+
+**What is being tested:** Whether you check the *gate/queue configuration* — not the logs — once you recognize "stuck" as a different failure mode from "failing," and whether you can generalize that instinct across CI systems.
+
+---
+
+### Cause 1: GitHub Actions — stuck at an environment approval gate
 
 **Break it (reproduce live):**
 
@@ -578,7 +632,7 @@ gh api /repos/ravdy/zen-pharma-backend/environments/prod
 gh api /orgs/ravdy/teams -q '.[].id'   # confirm 99999999 doesn't correspond to any active team
 ```
 
-**Root cause:** the job isn't hung due to a bug — it's parked at an `environment: prod` approval gate waiting for a reviewer team that was deleted (or a typo'd ID from a change to environment protection rules). No one can ever approve it, so it sits until the workflow's timeout eventually kills it.
+**Root cause:** the job is parked at an `environment: prod` approval gate waiting for a reviewer team that was deleted (or a typo'd ID from a change to environment protection rules). No one can ever approve it, so it sits until the workflow's timeout eventually kills it.
 
 **Fix:**
 
@@ -588,20 +642,9 @@ gh api -X PUT /repos/ravdy/zen-pharma-backend/environments/prod \
 gh run rerun <run-id>
 ```
 
-<details>
-<summary>📘 Teaching note</summary>
+### Cause 2: Jenkins — stuck in the build queue
 
-This one is worth calling out specifically because it reads completely differently from every other incident in this file: nothing is throwing an error, so log-grepping finds nothing. The fix is to inspect the *approval gate configuration*, not the workflow YAML and not the job logs — a good reminder that "stuck" and "failing" are different failure modes requiring different first moves.
-
-</details>
-
----
-
-**Q12. An interviewer whose company runs Jenkins instead of GitHub Actions asks: "A Jenkins pipeline job has been stuck in the queue for 20 minutes and never starts. How do you investigate?" How do you answer this using what you actually know from the zen-pharma GitHub Actions setup?**
-
-**What is being tested:** Whether you can generalize real experience to a tool you may not use day-to-day — a very common interviewer move to check if your knowledge is conceptual or just memorized commands.
-
-**Concept mapping — lead with this:**
+**Concept mapping — lead with this if the interviewer's shop runs Jenkins:**
 
 | GitHub Actions concept | Jenkins equivalent |
 |---|---|
@@ -614,10 +657,8 @@ This one is worth calling out specifically because it reads completely different
 **Break it (if you have a real Jenkins sandbox):**
 
 ```bash
-# Disconnect an agent
 sudo systemctl stop jenkins-agent
-
-# Or keep every executor busy with long-running jobs
+# or keep every executor busy:
 for i in 1 2 3 4; do curl -X POST "$JENKINS_URL/job/busy-job/build" --user "$USER:$TOKEN"; done
 ```
 
@@ -627,7 +668,6 @@ for i in 1 2 3 4; do curl -X POST "$JENKINS_URL/job/busy-job/build" --user "$USE
 curl -s "$JENKINS_URL/computer/api/json?pretty=true" --user "$USER:$TOKEN" \
   | jq '.computer[] | {displayName, offline, numExecutors}'
 
-# The queue API tells you exactly WHY a job hasn't been assigned an executor
 curl -s "$JENKINS_URL/queue/api/json?pretty=true" --user "$USER:$TOKEN" \
   | jq '.items[] | {why, stuck, blocked}'
 # "why": "Waiting for next available executor on ‘agent-2’"
@@ -635,17 +675,28 @@ curl -s "$JENKINS_URL/queue/api/json?pretty=true" --user "$USER:$TOKEN" \
 curl -s "$JENKINS_URL/computer/agent-2/api/json" --user "$USER:$TOKEN" | jq '.offlineCauseReason'
 ```
 
-**Root cause categories to name out loud, in order of likelihood:**
-1. **Agent disconnected** — network/firewall issue or an expired JNLP secret; check the agent's own logs and `systemctl status jenkins-agent`.
-2. **Executors all busy** — a previous job hung with no timeout and never released its executor.
-3. **Label mismatch** — the job's `agent { label 'x' }` doesn't match any connected node's labels.
-4. **Disk pressure** — Jenkins refuses to schedule work on a node below its configured free-disk-space threshold.
+**Root cause categories, in order of likelihood:** (1) agent disconnected — network/firewall or expired JNLP secret; (2) all executors on matching agents busy — a hung job with no timeout never released its executor; (3) label mismatch — the job's `agent { label 'x' }` doesn't match any connected node; (4) disk pressure — Jenkins won't schedule below its configured free-disk-space threshold.
 
 **Fix:** reconnect the agent, abort the hung job holding the executor, correct the node label, or free disk space (Workspace Cleanup plugin / prune old builds).
+
+---
+
+### Decision tree
+
+```
+CI job status = stuck, no error in logs
+       │
+       ├── GitHub Actions: `gh run view` says "Waiting for approval"
+       │       → Cause 1: check environment protection_rules — reviewer team may not exist
+       │
+       └── Jenkins: job sits in queue, never picks up an agent
+               → Cause 2: check queue API "why" field — offline agent, full executors, label
+                 mismatch, or disk pressure, in that order
+```
 
 <details>
 <summary>📘 Teaching note</summary>
 
-Worth including even though zen-pharma runs GitHub Actions: interviewers at Jenkins shops will ask this. The strongest answer bridges directly — "the mental model transfers 1:1: runner/agent health, concurrency limits, and approval gates are the three places I'd check on any CI system, GitHub Actions or Jenkins" — rather than saying "I haven't used Jenkins."
+Worth stating explicitly in an interview: "stuck" and "failing" are different failure modes requiring different first moves. A failing job means read the logs. A stuck job means the logs will be empty — go straight to the scheduler/gate configuration instead. The strongest answer to the tool-bridging half of this question is naming the mapping table out loud: "the mental model transfers 1:1 — runner/agent health, concurrency limits, and approval gates are the three places I'd check on any CI system."
 
 </details>
