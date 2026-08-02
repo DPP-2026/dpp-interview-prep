@@ -1,7 +1,7 @@
 # Security & DevSecOps — Interview Questions
 
 > Grounded in the zen-pharma security stack: CodeQL, Semgrep, Trivy, OWASP Dep Check, Cosign/Sigstore, Kyverno, GitHub OIDC, ESO + IRSA.
-> 23 questions covering container security, SAST/SCA, supply chain, IAM, and DevSecOps philosophy.
+> 25 questions covering container security, SAST/SCA, supply chain, IAM, DevSecOps philosophy, and TLS/certificate management.
 
 ---
 
@@ -14,6 +14,7 @@
 5. [AWS IAM & OIDC](#5-aws-iam--oidc) — Q15–Q19
 6. [DevSecOps Philosophy](#6-devsecops-philosophy) — Q21–Q23
 7. [External Secrets Operator](#7-external-secrets-operator) — C2–C3
+8. [TLS/SSL Certificate Management](#8-tlsssl-certificate-management) — C4
 
 ---
 
@@ -553,3 +554,37 @@ auth:
 ```
 
 This tells ESO: "use the JWT from the `external-secrets` ServiceAccount in `kube-system` to authenticate." This is the IRSA mechanism — the JWT is the web identity token in the `AssumeRoleWithWebIdentity` call.
+
+---
+
+## 8. TLS/SSL Certificate Management
+
+---
+
+## C4
+
+### Question
+> "The pharma portal's TLS is terminated by NGINX Ingress inside the cluster, behind a pass-through NLB. Where exactly is the certificate stored, how is it provisioned and renewed, and why can't you just use AWS ACM here?"
+
+### What the interviewer is really testing
+- Whether you understand TLS termination as an architectural decision, not just "some load balancer handles it"
+- Whether you know ACM's actual constraint (non-exportable private key), not just "ACM = AWS-managed certs"
+- Awareness that certificate management has more than one legitimate real-world pattern, not just one "correct" answer
+
+---
+
+### Model Answer
+
+**Storage:** the certificate and private key live in a Kubernetes `Secret` of type `kubernetes.io/tls` (`tls.crt` + `tls.key`), in the same namespace as the Ingress. The Ingress resource references it via `spec.tls[].secretName`; the NGINX Ingress Controller watches that Secret through the Kubernetes API and loads it into its running nginx TLS context, reloading automatically when the Secret changes — no file mount, no manual restart required.
+
+**Why ACM is off the table for this specific architecture.** ACM never lets you export a certificate's private key — by design, it only works when AWS itself terminates the TLS handshake (an ALB TLS listener, an NLB in TLS-listener mode, CloudFront, API Gateway). Here the NLB is a pure **Layer 4 pass-through** — it forwards raw TCP to node ports — and NGINX inside the cluster does the actual termination. Since nginx needs the real private key material and ACM will never hand that over, ACM simply cannot be the source of this certificate — regardless of whether the domain is public or internal. ACM only becomes usable if the architecture changes to put an ALB or CloudFront in front instead.
+
+**Two legitimate provisioning patterns for the in-cluster-termination architecture:**
+
+1. **cert-manager + Let's Encrypt (ACME).** A `Certificate` + `ClusterIssuer` resource; cert-manager runs the ACME HTTP-01/DNS-01 challenge, writes the issued cert straight into the Secret, and silently re-issues it ~30 days before expiry. Fully automated and free, but only a DV (domain-validated) certificate — no organization-identity verification.
+
+2. **A purchased CA certificate (DigiCert/Sectigo/etc.) synced via External Secrets Operator.** Many regulated pharma/finance orgs require an OV or EV certificate with a documented issuance trail for compliance, which Let's Encrypt doesn't provide. The key pair is generated once, the cert is issued out-of-band by the CA, stored in AWS Secrets Manager, and synced into the same `kubernetes.io/tls`-shaped Secret via ESO — reusing the exact pipeline this project already uses for `jwt-secret` and `db-credentials`.
+
+**The renewal difference is the part worth emphasizing.** Pattern 1 renews itself with zero human involvement. Pattern 2 does not — a purchased cert is typically 1–2 year validity, renewal requires a human-initiated request to the CA, and nothing but a monitoring alert on the certificate's `notAfter` date stands between "fine" and a silent expiry months later — there's no cert-manager `Certificate` object to show `READY=False`, so you have to alert directly off the cert's own expiry timestamp.
+
+**Security controls that apply either way:** RBAC should restrict `get`/`describe` on TLS secrets (they contain a private key), and EKS should have KMS envelope encryption enabled on etcd so the Secret is encrypted at rest, not just base64-encoded.

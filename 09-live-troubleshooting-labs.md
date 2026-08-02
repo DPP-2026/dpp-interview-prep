@@ -4,7 +4,7 @@
 >
 > **Only ever run the "Break it" steps against a personal or throwaway sandbox you fully control** (a scratch EKS/kind cluster, an isolated AWS sandbox account). Never run them against shared dev/qa, and never against anything resembling production. Several steps modify IAM policies, security groups, and Route53 records — treat them with the same care you would in a real account.
 >
-> This file deliberately goes **beyond Kubernetes**. Interviewers test the layers around the cluster just as often as the cluster itself — DNS, TLS/certificates, the load balancer, and the CI/CD system. For pure Kubernetes pod/scheduling incidents (`CrashLoopBackOff`, `Pending`, `ImagePullBackOff`, `OOMKilled`, node `NotReady`, ArgoCD drift), see the **"Incident Response Scenarios"** section of [`02-eks-kubernetes.md`](./02-eks-kubernetes.md) — this file picks up everywhere else.
+> This file deliberately goes **beyond Kubernetes**. Interviewers test the layers around the cluster just as often as the cluster itself — DNS, the load balancer, and the CI/CD system. For pure Kubernetes pod/scheduling incidents (`CrashLoopBackOff`, `Pending`, `ImagePullBackOff`, `OOMKilled`, node `NotReady`, ArgoCD drift), see the **"Incident Response Scenarios"** section of [`02-eks-kubernetes.md`](./02-eks-kubernetes.md). TLS/SSL certificate storage and management (cert-manager vs. purchased CA certs, why ACM doesn't fit an NLB pass-through architecture) is architectural rather than something you'd reproduce live — see `05-security-devsecops.md` C4 for that instead.
 >
 > **Why the questions are grouped, not split one-cause-per-question.** Real interviews at Google, Amazon, Microsoft, Meta, Netflix, Uber, and large regulated shops like JPMorgan and Goldman Sachs almost never ask "what causes X" for a single narrow cause — the standard senior SRE/Platform prompt is "here's a symptom, walk me through *every* plausible cause, in order of likelihood, and how you'd isolate each one." Answering with only one cause when three exist reads as inexperience, even if the one cause you name is correct. Each question below is grouped that way on purpose, with a decision tree at the end — that's the actual shape of the question you'll be asked, not an artificial simplification.
 
@@ -12,96 +12,19 @@
 
 ## Table of Contents
 
-1. [DNS & TLS](#1-dns--tls) — Q1–Q2
-2. [Load Balancer & Ingress](#2-load-balancer--ingress) — Q3–Q4
-3. [Database](#3-database) — Q5
-4. [Secrets Management](#4-secrets-management) — Q6
-5. [CI/CD Outside Kubernetes](#5-cicd-outside-kubernetes) — Q7–Q8
+1. [DNS](#1-dns) — Q1
+2. [Load Balancer & Ingress](#2-load-balancer--ingress) — Q2–Q3
+3. [Database](#3-database) — Q4
+4. [Secrets Management](#4-secrets-management) — Q5
+5. [CI/CD Outside Kubernetes](#5-cicd-outside-kubernetes) — Q6–Q7
 
 ---
 
-## 1. DNS & TLS
+## 1. DNS
 
 ---
 
-**Q1. The pharma portal (`https://portal.zen-pharma.internal`) suddenly shows a browser TLS warning — "Your connection is not private, NET::ERR_CERT_DATE_INVALID." Reproduce this live, investigate it, and fix it.**
-
-**Asked in this style at:** Google, Amazon, Microsoft — TLS/PKI lifecycle questions are a standard filter for any role touching public-facing services, because so few candidates have actually operated a CA/ACME pipeline rather than just clicking "renew" in a console.
-
-**What is being tested:** Whether you understand cert-manager's ACME renewal flow well enough to find *why* renewal failed, instead of just manually swapping in a new cert and never learning the root cause.
-
-**Break it (reproduce live):**
-
-Fastest way to get the exact symptom without waiting on ACME — install an already-expired self-signed cert directly into the secret the Ingress serves:
-
-```bash
-faketime '2024-01-01 00:00:00' openssl req -x509 -newkey rsa:2048 -nodes \
-  -keyout tls.key -out tls.crt -days 30 \
-  -subj "/CN=portal.zen-pharma.internal"
-
-kubectl create secret tls portal-tls -n prod \
-  --cert=tls.crt --key=tls.key --dry-run=client -o yaml | kubectl apply -f -
-```
-
-To reproduce the *realistic* root cause (a broken ACME renewal, not just a manually swapped cert), shadow cert-manager's HTTP-01 challenge path with a higher-priority Ingress rule, then force an early renewal:
-
-```bash
-kubectl annotate certificate portal-tls -n prod cert-manager.io/issue-temporary-certificate="true" --overwrite
-kubectl delete secret portal-tls -n prod   # forces cert-manager to reissue
-```
-
-**Investigate:**
-
-```bash
-curl -vI https://portal.zen-pharma.internal 2>&1 | grep -i "certificate\|expire"
-# curl: (60) SSL certificate problem: certificate has expired
-
-echo | openssl s_client -connect portal.zen-pharma.internal:443 -servername portal.zen-pharma.internal 2>/dev/null \
-  | openssl x509 -noout -dates
-# notBefore=Jan  1 00:00:00 2024 GMT
-# notAfter=Jan 31 00:00:00 2024 GMT      ← expired well over a year ago
-
-kubectl get certificate -n prod
-# NAME         READY   SECRET       AGE
-# portal-tls   False   portal-tls   400d
-
-kubectl describe certificate portal-tls -n prod
-kubectl get order,challenge -n prod
-kubectl describe challenge <challenge-name> -n prod
-# Reason: Waiting for HTTP-01 challenge propagation: failed to perform self check GET request... 404
-
-kubectl logs -n cert-manager deploy/cert-manager --since=10m | grep -i portal-tls
-```
-
-**Root cause:** cert-manager renews `renewBefore` days ahead of expiry. Renewal requires Let's Encrypt to reach `http://portal.zen-pharma.internal/.well-known/acme-challenge/<token>` and hit cert-manager's ephemeral solver pod. A conflicting Ingress rule (or an NGINX `configuration-snippet` someone added) intercepted that path first, the challenge 404'd, the renewal `Order` never completed, and the existing certificate kept aging past `notAfter` with no visible error until a user hit the browser warning.
-
-**Fix:**
-
-```bash
-kubectl delete ingress acme-challenge-override -n prod   # or: git revert the offending zen-gitops PR + argocd app sync
-kubectl delete challenge --all -n prod
-kubectl delete certificaterequest --all -n prod
-kubectl delete secret portal-tls -n prod   # cert-manager reissues cleanly now the path is clear
-kubectl describe certificate portal-tls -n prod   # watch Ready flip to True
-```
-
-**Verify & clean up:**
-
-```bash
-echo | openssl s_client -connect portal.zen-pharma.internal:443 -servername portal.zen-pharma.internal 2>/dev/null | openssl x509 -noout -dates
-curl -vI https://portal.zen-pharma.internal
-```
-
-<details>
-<summary>📘 Teaching note</summary>
-
-**Why this fails silently for weeks before anyone notices.** `renewBefore` (commonly 30 days) means you get a full month of "everything looks fine" before a broken ACME solver path becomes user-facing. The only proactive signal is `kubectl get certificate -A` showing `READY=False`, or a Prometheus alert on `certmanager_certificate_expiration_timestamp_seconds`. Waiting for the browser warning means you already missed a month of warning signs — this is the argument for alerting on certificate expiry directly rather than trusting "someone will notice."
-
-</details>
-
----
-
-**Q2. Two DNS complaints land at once: a public API domain resolves to the wrong, decommissioned load balancer, and separately, pods intermittently fail to resolve an internal RDS hostname. Walk me through investigating DNS end-to-end — from the public record down to in-cluster resolution — and fixing each layer.**
+**Q1. Two DNS complaints land at once: a public API domain resolves to the wrong, decommissioned load balancer, and separately, pods intermittently fail to resolve an internal RDS hostname. Walk me through investigating DNS end-to-end — from the public record down to in-cluster resolution — and fixing each layer.**
 
 **Asked in this style at:** Amazon and Google in particular love "trace the full resolution path" framing for SRE/Infra roles — it tests whether you treat DNS as a stack of independent layers (authoritative record → resolver cache → in-cluster resolver) instead of one opaque black box you restart when it's broken.
 
@@ -226,7 +149,7 @@ DNS-looking symptom
 
 ---
 
-**Q3. The load balancer reports target(s) unhealthy. Walk me through every plausible cause, from most to least likely, and how you'd isolate each one.**
+**Q2. The load balancer reports target(s) unhealthy. Walk me through every plausible cause, from most to least likely, and how you'd isolate each one.**
 
 **Asked in this style at:** Google, Meta, and Uber SRE interviews standardize on exactly this "give me the full decision tree, not just the one cause you personally hit" phrasing — they're checking whether your mental model spans the app, Kubernetes, and network layers, not just whichever single bug you remember from a past incident.
 
@@ -345,7 +268,7 @@ LB reports target(s) unhealthy
 
 ---
 
-**Q4. `/api/v2/inventory` returns 404 through the Ingress, but every other endpoint on `drug-catalog-service` works fine. Reproduce it, investigate, fix.**
+**Q3. `/api/v2/inventory` returns 404 through the Ingress, but every other endpoint on `drug-catalog-service` works fine. Reproduce it, investigate, fix.**
 
 **Asked in this style at:** Microsoft and Amazon — a very common "is this actually the same kind of 404 you're used to" trap question, because most candidates jump straight to application logs.
 
@@ -390,7 +313,7 @@ kubectl exec -n ingress-nginx deploy/ingress-nginx-controller -- \
 
 ---
 
-**Q5. The database layer is misbehaving under normal operation — walk me through diagnosing connection issues, both under steady load and right after a failover.**
+**Q4. The database layer is misbehaving under normal operation — walk me through diagnosing connection issues, both under steady load and right after a failover.**
 
 **Asked in this style at:** JPMorgan, Goldman Sachs, and Amazon lean heavily on DB connection-pool behavior for backend/platform roles — it's one of the most reliable "have you actually operated this in production" filters, since it's very hard to fake without hands-on experience.
 
@@ -495,7 +418,7 @@ DB-layer symptom
 
 ---
 
-**Q6. `kubectl get externalsecret -A` shows `jwt-secret` in `prod` as `SecretSyncedError`. The Kubernetes Secret still exists, but pods reading it are getting stale/empty values. Reproduce it, investigate, fix.**
+**Q5. `kubectl get externalsecret -A` shows `jwt-secret` in `prod` as `SecretSyncedError`. The Kubernetes Secret still exists, but pods reading it are getting stale/empty values. Reproduce it, investigate, fix.**
 
 **Asked in this style at:** Google and Microsoft — IRSA/Workload Identity exact-string-matching bugs are a favorite "small typo, big blast radius" question because they can't be answered from documentation alone; you have to have actually hit one.
 
@@ -553,11 +476,11 @@ kubectl rollout restart deployment auth-service -n prod
 
 ---
 
-**Q7. The deploy job in GitHub Actions starts failing with `Error: Could not assume role with OIDC: Not authorized to perform sts:AssumeRoleWithWebIdentity`, right after a Terraform change to the CI IAM role. Reproduce it, investigate, fix.**
+**Q6. The deploy job in GitHub Actions starts failing with `Error: Could not assume role with OIDC: Not authorized to perform sts:AssumeRoleWithWebIdentity`, right after a Terraform change to the CI IAM role. Reproduce it, investigate, fix.**
 
 **Asked in this style at:** Netflix, Uber, and Meta — OIDC federation bugs are a common "prove you understand the trust boundary, not just the YAML" question for platform/infra roles building internal CI systems.
 
-**What is being tested:** Whether you know OIDC federation does exact string matching on the JWT's `sub` claim — the same failure class as the IRSA story in `07-behavioral-realtime.md` Q6 and Q6 above, one layer up the stack.
+**What is being tested:** Whether you know OIDC federation does exact string matching on the JWT's `sub` claim — the same failure class as the IRSA story in `07-behavioral-realtime.md` Q6 and Q5 above, one layer up the stack.
 
 **Break it (reproduce live):**
 
@@ -602,7 +525,7 @@ condition {
 
 ---
 
-**Q8. A CI/CD job is stuck — not failing, not erroring, just sitting there indefinitely. Walk me through investigating this on GitHub Actions, and how the same investigation maps if the interviewer's company runs Jenkins instead.**
+**Q7. A CI/CD job is stuck — not failing, not erroring, just sitting there indefinitely. Walk me through investigating this on GitHub Actions, and how the same investigation maps if the interviewer's company runs Jenkins instead.**
 
 **Asked in this style at:** large regulated shops still running Jenkins (banks, insurers, older tech giants mid-migration) ask the Jenkins half directly; Big Tech infra teams (Google, Amazon, Meta) ask the "map it to a tool you don't use" half specifically to test conceptual vs. memorized knowledge.
 

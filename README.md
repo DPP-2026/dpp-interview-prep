@@ -13,11 +13,11 @@
 | [02-eks-kubernetes.md](./02-eks-kubernetes.md) | EKS & Kubernetes | 24 |
 | [03-cicd-github-actions.md](./03-cicd-github-actions.md) | CI/CD & GitHub Actions | 18 |
 | [04-gitops-argocd.md](./04-gitops-argocd.md) | GitOps & ArgoCD | 23 |
-| [05-security-devsecops.md](./05-security-devsecops.md) | Security & DevSecOps | 24 |
+| [05-security-devsecops.md](./05-security-devsecops.md) | Security & DevSecOps | 25 |
 | [06-vpc-networking-aws.md](./06-vpc-networking-aws.md) | VPC, Networking & AWS | 18 |
 | [07-behavioral-realtime.md](./07-behavioral-realtime.md) | Behavioral & Real-Time | 19 |
 | [08-observability-logging-monitoring.md](./08-observability-logging-monitoring.md) | Observability — Logging & Monitoring | 24 |
-| [09-live-troubleshooting-labs.md](./09-live-troubleshooting-labs.md) | Live Troubleshooting Labs — break it, investigate it, fix it | 8 |
+| [09-live-troubleshooting-labs.md](./09-live-troubleshooting-labs.md) | Live Troubleshooting Labs — break it, investigate it, fix it | 7 |
 | **Total** | | **203** |
 
 ---
